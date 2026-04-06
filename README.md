@@ -107,24 +107,59 @@ To run this project locally, you need Go and Docker installed.
 *   `PUT /sessions/{sessionID}/confirm`: Completes the purchase/booking process, changing the temporary hold into a confirmed booking.
 *   `DELETE /sessions/{sessionID}`: Explicitly releases a held seat (or it expires eventually based on TTL).
 
-## 🔒 Locking Implementation Details
+## 🔒 The Solution: How We Prevent Double Bookings
 
-To guarantee that a seat cannot be double-booked, we implement **Pessimistic Locking**.
+To guarantee that a seat cannot be double-booked across a distributed environment (e.g. if we had multiple Go API servers running), we implement **Pessimistic Locking** backed by Redis.
 
-*   **InMemory**: In `ConcurrentMemoryStore`, we utilize a `sync.RWMutex`. We call `.Lock()` during booking meaning no other thread can read or write to our map at the same time until `.Unlock()` is called.
-*   **Redis (Production Ready)**: In `RedisStore`, we achieve pessimistic locking using the Redis `SETNX` (Set if Not Exists) command. When holding a seat, we try to create a lock key (e.g., `seat:Inception:A1`). If the operation returns `OK`, this user won the lock. If it fails, another user holds the seat and we reject the new request immediately, preserving data integrity in distributed environments.
+When two requests attempt to book seat `A1` for movie `Inception` literally microseconds apart, we don't first query if it's free. Instead, the backend goes straight to our `RedisStore`.
 
-## 🧪 Testing and Comparing Concurrent Solutions
+Inside `redis_store.go`, we rely on a critically fundamental feature of Redis: **`SETNX` (Set if Not Exists)**.
+We build a unique key like: `seat:Inception:A1`.
+We command Redis to store the user's booking data into this key **ONLY IF** the key does not already exist.
 
-Inside `internal/booking/service_test.go`, we have created stress tests to prove our implementation works during extreme load.
+```go
+res := s.rdb.SetArgs(ctx, key, val, redis.SetArgs{
+    Mode: "NX", // SET IF NOT EXISTS! THIS IS THE MAGIC.
+    TTL:  defaultHoldTTL,
+})
+```
 
-We spin up **100,000 independent goroutines**, all trying to book exactly the same seat (`screen-1`, `A1`) at the exact same instant. 
+Because Redis operates on a single execution thread, the very first request to hit Redis gets successfully processed and returns `"OK"`. Every single subsequent request asking to hold that seat will get rejected by Redis immediately.
+If the operation returns `OK`, this user won the lock. If it fails, another user holds the seat and our API gracefully rejects the new request with an `ErrSeatAlreadyBooked`, perfectly eliminating data inconsistency issues regardless of how much scale or traffic hits the servers.
 
-The test succeeds if and only if:
-1.  **Exactly 1** goroutine successfully books the seat.
-2.  **Exactly 99,999** goroutines gracefully fail with an `ErrSeatAlreadyBooked`.
+## 🧪 Running the Load Tests (Proving the Concept)
 
-We initially compare:
-*   `MemoryStore`: Standard Go map (Not thread-safe). Concurrency results in race conditions leading to double bookings and Go runtime panics.
-*   `ConcurrentMemoryStore`: Fixes panics utilizing `sync.RWMutex`, solving the issue for a single-node API.
-*   `RedisStore`: Employs `SETNX` solving the problem not just natively, but in a distributed multi-node architecture.
+We don't just assert that this prevents double-booking; we actively *prove* it with intense automated load testing.
+
+Inside `internal/booking/service_test.go`, there is a test called `TestConcurrentBooking_ExactlyOneWins`.
+Anyone can run this test locally using:
+
+```bash
+go test -v ./internal/booking -run TestConcurrentBooking_ExactlyOneWins
+```
+
+**Test Output Example:**
+```bash
+=== RUN   TestConcurrentBooking_ExactlyOneWins
+2026/04/06 22:59:21 connected to redis at localhost:6379
+2026/04/06 22:59:21 Session Booked {4f12cef4-28df-4b13-910c-14d7f17c9a0d screen-1 A1 14f6773d-ba09-49eb-ab10-9e7b819f7381 held ...}
+--- PASS: TestConcurrentBooking_ExactlyOneWins (1.44s)
+PASS
+ok      booking-system/internal/booking 1.503s
+```
+
+### What does this test do?
+
+1. It spans **100,000 concurrent Goroutines**, representing an instant spike where 100,000 distinct users are all vigorously attempting to immediately book exact same seat (`screen-1`, `A1`).
+2. We utilize a WaitGroup (`sync.WaitGroup`) to ensure all 100k threads crash down on our Redis backend at the exact same split-second.
+3. Every goroutine records its outcome into an atomic counter (either a success or a failure).
+
+### The Result We Guarantee
+
+The test asserts structurally that:
+1. **Exactly 1** goroutine successfully books the seat.
+2. **Exactly 99,999** goroutines fail and receive an error gracefully.
+
+Although having 99,999 "failures" sounds bad on the surface, this is actually the **perfect outcome** for a ticketing system. We preserved guaranteed data integrity under massive immediate contention. No two database entries were created, and nobody was falsely sold tickets that didn't exist.
+
+We have historically compared the `RedisStore` implementation against simpler code like the `MemoryStore`, which relies on standard Go map structures. Under the exact same 100k test without mutex protection, standard slices cause major race conditions, map assignment panics, and massive overlapping duplicate data writes. By migrating to Pessimistic Locking with Redis `SETNX`, or utilizing `sync.RWMutex` (as found in `ConcurrentMemoryStore`), our API achieves perfect multi-user safety.
